@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import importlib
 import inspect
 import json
 import os
 import re
 from dataclasses import replace
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Literal, Optional
+
+import packaging.version
 
 from ..conversion_mapping import (
     _MODEL_TO_CONVERSION_PATTERN,
@@ -62,6 +66,11 @@ logger = logging.get_logger(__name__)
 
 if TYPE_CHECKING:
     from ..modeling_utils import LoadStateDictConfig
+
+
+@lru_cache(None)
+def is_peft_version_ge_0_19_0():
+    return packaging.version.parse(importlib.metadata.version("peft")) >= packaging.version.parse("0.19.0")
 
 
 def _block_diag_3d(*tensors):
@@ -195,6 +204,15 @@ class PermuteDims(ConversionOps):
 def _build_peft_weight_mapping(
     weight_conversions: list[WeightConverter | WeightRenaming] | None, adapter_name: str, peft_config=None
 ) -> list[WeightConverter | WeightRenaming]:
+    if is_peft_version_ge_0_19_0():
+        import peft
+
+        return peft.utils.build_peft_weight_mapping_for_transformers(
+            weight_conversions=weight_conversions,
+            adapter_name=adapter_name,
+            peft_config=peft_config,
+        )
+
     # We iterate over all the operations of the original model and simply edit them to apply to the PEFT adapter when
     # appropriate.
     if not weight_conversions:
@@ -336,9 +354,12 @@ def patch_moe_parameter_targeting(model, peft_config):
     """PEFT currently assumes that expert layers are of shape
         (expert, in, out)
     but with Mixtral in transformers v5 this is not true anymore.
-    This will be addressed in PEFT >0.19 until then we need to handle
+    This will be addressed in PEFT >=0.19 until then we need to handle
     it here for now.
     """
+    if is_peft_version_ge_0_19_0():
+        return
+
     from functools import wraps
 
     import peft
@@ -668,7 +689,9 @@ class PeftAdapterMixin:
         # Retrieve the name or path of the model, one could also use self.config._name_or_path
         # but to be consistent with what we do in PEFT: https://github.com/huggingface/peft/blob/6e783780ca9df3a623992cc4d1d665001232eae0/src/peft/mapping.py#L100
         adapter_config.base_model_name_or_path = self.__dict__.get("name_or_path", None)
-        # TODO: WE NEED TOO APPLY OUR DYNAMIC WEIGHT CONVERSION AT SOME POINT HERE!
+
+        adapter_config = convert_peft_config_for_transformers(adapter_config, model=self, conversions=None)
+
         inject_adapter_in_model(adapter_config, self, adapter_name)
 
         self.set_adapter(adapter_name)
@@ -1024,6 +1047,15 @@ def _convert_peft_config_moe(peft_config, model_type: str):
 
 
 def convert_peft_config_for_transformers(peft_config, model: torch.nn.Module, conversions: list[Any] | None):
+    if is_peft_version_ge_0_19_0():
+        import peft
+
+        return peft.utils.convert_peft_config_for_transformers(
+            peft_config=peft_config,
+            model=model,
+            conversions=conversions,
+        )
+
     # FIXME document this properly
     # If, for any reason, we cannot apply conversion, we just return the PEFT config as is.
     from peft import PeftType  # avoid circular import

@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from datasets import Dataset, DatasetDict
 from huggingface_hub import hf_hub_download
@@ -206,6 +207,89 @@ class PeftIntegrationTester(unittest.TestCase, PeftTesterMixin):
                     model.save_pretrained(tmpdirname)
                     model_from_pretrained = transformers_class.from_pretrained(tmpdirname).to(torch_device)
                     self.assertTrue(self._check_lora_correctly_converted(model_from_pretrained))
+
+    @unittest.mock.patch("transformers.integrations.peft.is_peft_version_ge_0_19_0", lambda: True)
+    def test_peft_load_adapter_calls_conversion_in_peft(self):
+        """
+        Tests if for newer versions of PEFT (>=0.19.0) PEFT's conversion API is used instead of the
+        transformers implementation.
+
+        Uses the transformers implementation to mock PEFT calls.
+        """
+        import peft.utils
+        from peft import LoraConfig
+
+        from transformers.integrations.peft import _build_peft_weight_mapping, convert_peft_config_for_transformers
+
+        def original_convert(*args, **kwargs):
+            with unittest.mock.patch("transformers.integrations.peft.is_peft_version_ge_0_19_0", lambda: False):
+                return convert_peft_config_for_transformers(*args, **kwargs)
+
+        def original_build(*args, **kwargs):
+            with unittest.mock.patch("transformers.integrations.peft.is_peft_version_ge_0_19_0", lambda: False):
+                return _build_peft_weight_mapping(*args, **kwargs)
+
+        with (
+            patch.object(
+                peft.utils, "convert_peft_config_for_transformers", create=True, wraps=original_convert
+            ) as convert_config_mock,
+            patch.object(
+                peft.utils, "build_peft_weight_mapping_for_transformers", create=True, wraps=original_build
+            ) as build_mapping_mock,
+        ):
+            for model_id, peft_model_id in zip(self.transformers_test_model_ids, self.peft_test_model_ids):
+                for transformers_class in self.transformers_test_model_classes:
+                    model = transformers_class.from_pretrained(model_id).to(torch_device)
+
+                    peft_config = LoraConfig()
+                    state_dict_path = hf_hub_download(peft_model_id, "adapter_model.bin")
+                    check_torch_load_is_safe()
+                    dummy_state_dict = torch.load(state_dict_path, weights_only=True)
+
+                    model.load_adapter(
+                        adapter_state_dict=dummy_state_dict, peft_config=peft_config, low_cpu_mem_usage=False
+                    )
+                    self.assertTrue(self._check_lora_correctly_converted(model))
+
+                    assert build_mapping_mock.call_count > 0
+
+            expected_count = len(self.transformers_test_model_ids) * len(self.transformers_test_model_classes)
+            self.assertTrue(convert_config_mock.call_count == expected_count)
+            self.assertTrue(build_mapping_mock.call_count == expected_count)
+
+    @unittest.mock.patch("transformers.integrations.peft.is_peft_version_ge_0_19_0", lambda: True)
+    def test_peft_add_adapter_calls_conversion_in_peft(self):
+        """
+        Tests if for newer versions of PEFT (>=0.19.0) PEFT's conversion API is used instead of the
+        transformers implementation.
+
+        Uses the transformers implementation to mock PEFT calls.
+        """
+        import peft.utils
+        from peft import LoraConfig
+
+        from transformers.integrations.peft import convert_peft_config_for_transformers
+
+        def original_convert(*args, **kwargs):
+            with unittest.mock.patch("transformers.integrations.peft.is_peft_version_ge_0_19_0", lambda: False):
+                return convert_peft_config_for_transformers(*args, **kwargs)
+
+        with (
+            patch.object(
+                peft.utils, "convert_peft_config_for_transformers", create=True, wraps=original_convert
+            ) as convert_config_mock,
+        ):
+            for model_id in self.transformers_test_model_ids:
+                for transformers_class in self.transformers_test_model_classes:
+                    model = transformers_class.from_pretrained(model_id).to(torch_device)
+
+                    peft_config = LoraConfig(init_lora_weights=False)
+                    model.add_adapter(peft_config)
+
+                    self.assertTrue(self._check_lora_correctly_converted(model))
+
+            expected_count = len(self.transformers_test_model_ids) * len(self.transformers_test_model_classes)
+            self.assertTrue(convert_config_mock.call_count == expected_count)
 
     def test_peft_add_adapter_modules_to_save(self):
         """
